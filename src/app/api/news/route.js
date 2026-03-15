@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getCachedStories, setCachedStories } from "@/lib/cache";
 import { CATEGORY_QUERIES } from "@/lib/constants";
 
-const ANTHROPIC_API_KEY = "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";
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 // Use a widely available model
 const MODEL = "claude-sonnet-4-5-20250929";
