@@ -2,176 +2,150 @@ import { NextResponse } from "next/server";
 import { getCachedStories, setCachedStories } from "@/lib/cache";
 import { CATEGORY_QUERIES } from "@/lib/constants";
 
+// Increase Vercel serverless function timeout (default is 10s, max 60s on Hobby)
+export const maxDuration = 60;
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = "gemini-2.5-flash";
 
 function parseArticles(textContent, groundingChunks, category) {
-  // First try to extract JSON from the response
+  // Build URL lookup from grounding metadata
+  const groundingUrls = (groundingChunks || [])
+    .filter((c) => c.web)
+    .map((c) => ({ title: c.web.title, url: c.web.uri }));
+
   try {
-    let cleaned = textContent.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-    const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
+    let cleaned = textContent
+      .replace(/```json\s*/gi, "")
+      .replace(/```\s*/g, "")
+      .trim();
+
+    const jsonMatch = cleaned.match(/\[[\s\S]*?\](?=\s*$|\s*[^,\]\}])/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        // Build a URL lookup from grounding chunks
-        const urlMap = {};
-        if (groundingChunks) {
-          groundingChunks.forEach((chunk) => {
-            if (chunk.web) {
-              urlMap[chunk.web.title?.toLowerCase()] = chunk.web.uri;
-            }
-          });
-        }
+        return parsed.map((a, i) => {
+          // Try to match a grounding URL if the article URL is missing or is a redirect
+          let articleUrl = a.url || null;
+          if (!articleUrl || articleUrl.includes("vertexaisearch.cloud.google.com")) {
+            const match = groundingUrls.find(
+              (g) =>
+                g.title &&
+                a.title &&
+                (g.title.toLowerCase().includes(a.source?.toLowerCase()) ||
+                  a.title.toLowerCase().includes(g.title.toLowerCase().slice(0, 20)))
+            );
+            if (match) articleUrl = match.url;
+          }
 
-        return parsed.map((a, i) => ({
-          id: `${category}-${Date.now()}-${i}`,
-          title: a.title || "Untitled Story",
-          summary: a.summary || a.description || "",
-          source: a.source || "Unknown",
-          url: a.url || null,
-          date: a.date || "Recent",
-          mood: ["hopeful", "inspiring", "breakthrough", "heartwarming"].includes(a.mood)
-            ? a.mood
-            : "hopeful",
-          category,
-        }));
+          return {
+            id: `${category}-${Date.now()}-${i}`,
+            title: a.title || "Untitled Story",
+            summary: a.summary || a.description || "",
+            source: a.source || "Unknown",
+            url: articleUrl,
+            date: a.date || "Recent",
+            mood: ["hopeful", "inspiring", "breakthrough", "heartwarming"].includes(a.mood)
+              ? a.mood
+              : "hopeful",
+            category,
+          };
+        });
       }
     }
-    console.warn("[Placing Jade] No JSON array found in response");
+
+    // Fallback: try to find any JSON array in the text
+    const anyArray = cleaned.match(/\[[\s\S]*\]/);
+    if (anyArray) {
+      try {
+        const parsed = JSON.parse(anyArray[0]);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed.map((a, i) => ({
+            id: `${category}-${Date.now()}-${i}`,
+            title: a.title || "Untitled Story",
+            summary: a.summary || a.description || "",
+            source: a.source || "Unknown",
+            url: a.url || null,
+            date: a.date || "Recent",
+            mood: ["hopeful", "inspiring", "breakthrough", "heartwarming"].includes(a.mood)
+              ? a.mood
+              : "hopeful",
+            category,
+          }));
+        }
+      } catch {}
+    }
+
+    console.warn("[PJ] No JSON array found. Response preview:", cleaned.slice(0, 500));
   } catch (e) {
-    console.error("[Placing Jade] Parse error:", e.message);
+    console.error("[PJ] Parse error:", e.message, "Text preview:", textContent.slice(0, 300));
   }
   return [];
 }
 
-async function callGemini(contents, useSearch = true) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+async function fetchFromGemini(category) {
+  const query = CATEGORY_QUERIES[category] || CATEGORY_QUERIES.all;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
-  const body = {
-    contents: [
-      {
-        parts: [{ text: contents }],
-      },
-    ],
-    generationConfig: {
-      maxOutputTokens: 6000,
-      temperature: 0.7,
-    },
-  };
+  const prompt = `You are a positive news curator for "Placing Jade". Search the web for real, recent positive news stories about: ${query}
 
-  // Add Google Search grounding tool
-  if (useSearch) {
-    body.tools = [{ google_search: {} }];
-  }
+After finding stories, return ONLY a JSON array (no other text, no markdown). Each object needs:
+- "title": compelling headline (string)
+- "summary": 4-6 sentences on what happened, why it matters, broader impact (string)
+- "source": publication name (string)
+- "url": direct URL to original article (string)
+- "date": approximate date like "March 2026" (string)
+- "mood": one of "hopeful", "inspiring", "breakthrough", "heartwarming" (string)
 
-  // When not using search, we can force JSON output
-  if (!useSearch) {
-    body.generationConfig.responseMimeType = "application/json";
-  }
+Return 10-12 real, verifiable stories. IMPORTANT: Your response must start with [ and end with ]. No other text before or after the JSON array.`;
 
-  console.log(`[Placing Jade] Calling Gemini (search=${useSearch})`);
+  console.log(`[PJ] Fetching "${category}" with Google Search...`);
 
-  const response = await fetch(`${url}?key=${GEMINI_API_KEY}`, {
+  const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        maxOutputTokens: 8000,
+        temperature: 0.7,
+      },
+      tools: [{ google_search: {} }],
+    }),
   });
 
   if (!response.ok) {
     const errText = await response.text();
-    console.error(`[Placing Jade] Gemini ${response.status}:`, errText.slice(0, 500));
-    return { ok: false, status: response.status, error: errText };
+    console.error(`[PJ] Gemini ${response.status}:`, errText.slice(0, 500));
+    throw new Error(`Gemini API error ${response.status}: ${errText.slice(0, 200)}`);
   }
 
   const data = await response.json();
-  return { ok: true, data };
-}
+  const candidate = data.candidates?.[0];
 
-async function fetchFromGemini(category) {
-  const query = CATEGORY_QUERIES[category] || CATEGORY_QUERIES.all;
-
-  // STEP 1: Use Google Search grounding to find real stories
-  const searchPrompt = `Find 12-15 recent, real, positive news stories about: ${query}
-
-For each story provide: the headline, a 4-6 sentence summary of what happened and why it matters, the source publication name, the URL, and the approximate date. Focus on genuinely uplifting developments.`;
-
-  console.log(`[Placing Jade] Step 1: Searching for "${category}" stories...`);
-  let searchResult = await callGemini(searchPrompt, true);
-
-  let storiesText = "";
-
-  if (searchResult.ok) {
-    const candidate = searchResult.data.candidates?.[0];
-    if (candidate?.content?.parts) {
-      storiesText = candidate.content.parts
-        .filter((p) => p.text)
-        .map((p) => p.text)
-        .join("\n");
-
-      // Also gather URLs from grounding metadata
-      const chunks = candidate.groundingMetadata?.groundingChunks || [];
-      if (chunks.length > 0) {
-        storiesText += "\n\nGrounding sources:\n";
-        chunks.forEach((c) => {
-          if (c.web) {
-            storiesText += `- ${c.web.title}: ${c.web.uri}\n`;
-          }
-        });
-      }
-    }
-    console.log(`[Placing Jade] Step 1 complete. Got ${storiesText.length} chars of content.`);
-  } else {
-    console.warn(`[Placing Jade] Grounded search failed, using ungrounded search...`);
-    // Fallback: search without grounding
-    searchResult = await callGemini(searchPrompt, false);
-    if (searchResult.ok) {
-      const candidate = searchResult.data.candidates?.[0];
-      storiesText = candidate?.content?.parts
-        ?.filter((p) => p.text)
-        .map((p) => p.text)
-        .join("\n") || "";
-    }
+  if (!candidate?.content?.parts) {
+    console.error("[PJ] No candidate. Full response:", JSON.stringify(data).slice(0, 500));
+    throw new Error("No content in Gemini response");
   }
 
-  if (!storiesText) {
-    throw new Error("No content from search step");
-  }
-
-  // STEP 2: Format into clean JSON (no search tool, force JSON output)
-  const formatPrompt = `Below are positive news stories found via web search. Convert them into a JSON array. Return ONLY a valid JSON array, no other text.
-
-Each object must have exactly these fields:
-- "title": string (compelling headline)
-- "summary": string (4-6 sentences)
-- "source": string (publication name)
-- "url": string (direct URL to original article, or "" if not available)
-- "date": string (e.g. "March 2026")
-- "mood": string (one of: "hopeful", "inspiring", "breakthrough", "heartwarming")
-
-Here are the stories to format:
-
-${storiesText}`;
-
-  console.log(`[Placing Jade] Step 2: Formatting as JSON...`);
-  const formatResult = await callGemini(formatPrompt, false);
-
-  if (!formatResult.ok) {
-    throw new Error(`Gemini format step failed: ${formatResult.status}`);
-  }
-
-  const formatCandidate = formatResult.data.candidates?.[0];
-  const jsonText = formatCandidate?.content?.parts
-    ?.filter((p) => p.text)
+  const text = candidate.content.parts
+    .filter((p) => p.text)
     .map((p) => p.text)
-    .join("\n") || "";
+    .join("\n");
 
-  console.log(`[Placing Jade] Step 2 complete. Parsing JSON (${jsonText.length} chars)...`);
+  const groundingChunks = candidate.groundingMetadata?.groundingChunks || [];
 
-  if (!jsonText) {
-    throw new Error("No text from format step");
+  console.log(`[PJ] Got ${text.length} chars, ${groundingChunks.length} grounding chunks. Parsing...`);
+
+  const articles = parseArticles(text, groundingChunks, category);
+
+  if (articles.length === 0) {
+    // Log what we got so we can debug
+    console.error("[PJ] Parse returned 0 articles. Text preview:", text.slice(0, 800));
+    console.error("[PJ] Finish reason:", candidate.finishReason);
   }
 
-  return parseArticles(jsonText, [], category);
+  return articles;
 }
 
 export async function GET(request) {
@@ -184,71 +158,11 @@ export async function GET(request) {
       hasApiKey: !!GEMINI_API_KEY,
       keyPrefix: GEMINI_API_KEY ? GEMINI_API_KEY.slice(0, 10) + "..." : "NOT SET",
       model: MODEL,
-      provider: "Google Gemini",
+      provider: "Google Gemini (with Search)",
+      maxDuration: 60,
       categories: Object.keys(CATEGORY_QUERIES),
       timestamp: new Date().toISOString(),
     });
-  }
-
-  // Test endpoint — shows raw API responses for debugging
-  if (searchParams.get("test") === "true") {
-    try {
-      // Simple test call with search
-      const testResult = await callGemini(
-        "Find 2 recent positive conservation news stories. For each give: title, 2-sentence summary, source name, URL, date.",
-        true
-      );
-
-      if (!testResult.ok) {
-        return NextResponse.json({
-          step: "search_call",
-          error: testResult.error?.slice(0, 500),
-          status: testResult.status,
-        });
-      }
-
-      const candidate = testResult.data.candidates?.[0];
-      const searchText = candidate?.content?.parts
-        ?.filter((p) => p.text)
-        .map((p) => p.text)
-        .join("\n") || "NO TEXT";
-      const groundingChunks = candidate?.groundingMetadata?.groundingChunks || [];
-      const finishReason = candidate?.finishReason;
-
-      // Now try format step
-      const formatResult = await callGemini(
-        `Convert these stories to a JSON array. Each object needs: "title", "summary", "source", "url", "date", "mood" (one of: hopeful, inspiring, breakthrough, heartwarming). Return ONLY valid JSON array.\n\n${searchText}`,
-        false
-      );
-
-      let formatText = "FORMAT CALL FAILED";
-      let parsed = null;
-      if (formatResult.ok) {
-        formatText = formatResult.data.candidates?.[0]?.content?.parts
-          ?.filter((p) => p.text)
-          .map((p) => p.text)
-          .join("\n") || "NO FORMAT TEXT";
-
-        try {
-          const cleaned = formatText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-          const match = cleaned.match(/\[[\s\S]*\]/);
-          if (match) parsed = JSON.parse(match[0]);
-        } catch (e) {
-          parsed = { parseError: e.message };
-        }
-      }
-
-      return NextResponse.json({
-        step1_searchText: searchText.slice(0, 1000),
-        step1_groundingChunks: groundingChunks.slice(0, 3),
-        step1_finishReason: finishReason,
-        step2_formatText: formatText.slice(0, 1000),
-        step2_parsed: parsed ? (Array.isArray(parsed) ? `Array of ${parsed.length} items` : parsed) : null,
-        step2_firstItem: Array.isArray(parsed) ? parsed[0] : null,
-      });
-    } catch (e) {
-      return NextResponse.json({ testError: e.message });
-    }
   }
 
   // Validate category
@@ -259,7 +173,7 @@ export async function GET(request) {
   // Check API key
   if (!GEMINI_API_KEY) {
     return NextResponse.json(
-      { error: "GEMINI_API_KEY not set. Add it in Vercel → Settings → Environment Variables, then redeploy." },
+      { error: "GEMINI_API_KEY not set. Add it in Vercel → Settings → Environment Variables." },
       { status: 500 }
     );
   }
@@ -274,13 +188,13 @@ export async function GET(request) {
     });
   }
 
-  // Cache miss — fetch fresh stories
+  // Fetch fresh stories
   try {
     const stories = await fetchFromGemini(category);
 
     if (stories.length === 0) {
       return NextResponse.json(
-        { stories: [], cached: false, error: "No stories found" },
+        { stories: [], cached: false, error: "No stories found — please try again" },
         { status: 200 }
       );
     }
@@ -293,7 +207,7 @@ export async function GET(request) {
       cachedAt: Date.now(),
     });
   } catch (e) {
-    console.error("[Placing Jade] Handler error:", e);
+    console.error("[PJ] Error:", e);
     return NextResponse.json(
       { error: e.message || "Failed to fetch stories" },
       { status: 500 }
