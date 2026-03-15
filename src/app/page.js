@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Header from "@/components/Header";
 import CategoryNav from "@/components/CategoryNav";
 import StoryOfTheDay from "@/components/StoryOfTheDay";
@@ -23,12 +23,24 @@ export default function Home() {
   const [toast, setToast] = useState(null);
   const [mounted, setMounted] = useState(false);
 
+  // Client-side cache — stores fetched stories per category in the browser session
+  const clientCache = useRef(new Map());
+  const CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+
   // Load bookmarks from localStorage on mount
   useEffect(() => {
     setMounted(true);
     try {
       const saved = localStorage.getItem("pj-bookmarks");
       if (saved) setBookmarks(JSON.parse(saved));
+      // Restore client cache from sessionStorage
+      const savedCache = sessionStorage.getItem("pj-story-cache");
+      if (savedCache) {
+        const parsed = JSON.parse(savedCache);
+        Object.entries(parsed).forEach(([key, val]) => {
+          clientCache.current.set(key, val);
+        });
+      }
     } catch {}
   }, []);
 
@@ -65,11 +77,28 @@ export default function Home() {
     [bookmarks]
   );
 
+  const saveClientCache = useCallback(() => {
+    try {
+      const obj = {};
+      clientCache.current.forEach((val, key) => { obj[key] = val; });
+      sessionStorage.setItem("pj-story-cache", JSON.stringify(obj));
+    } catch {}
+  }, []);
+
   const loadNews = async (category) => {
     setActiveCategory(category);
     setShowBookmarks(false);
-    setLoading(true);
     setError(null);
+
+    // Check client-side cache first
+    const cached = clientCache.current.get(category);
+    if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
+      setArticles(cached.stories);
+      setFromCache(true);
+      return;
+    }
+
+    setLoading(true);
     setArticles([]);
     setStatus("Searching for good news...");
 
@@ -87,6 +116,12 @@ export default function Home() {
         setError("No stories found — try another category!");
       } else {
         setArticles(data.stories);
+        // Store in client cache
+        clientCache.current.set(category, {
+          stories: data.stories,
+          fetchedAt: Date.now(),
+        });
+        saveClientCache();
       }
     } catch (e) {
       console.error("loadNews error:", e);
