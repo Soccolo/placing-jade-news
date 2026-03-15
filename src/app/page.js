@@ -33,15 +33,27 @@ export default function Home() {
     try {
       const saved = localStorage.getItem("pj-bookmarks");
       if (saved) setBookmarks(JSON.parse(saved));
-      // Restore client cache from sessionStorage
+      // Restore client cache from sessionStorage (only valid entries)
       const savedCache = sessionStorage.getItem("pj-story-cache");
       if (savedCache) {
         const parsed = JSON.parse(savedCache);
+        let hasValid = false;
         Object.entries(parsed).forEach(([key, val]) => {
-          clientCache.current.set(key, val);
+          // Only restore cache entries that have actual stories
+          if (val.stories?.length > 0 && val.fetchedAt) {
+            clientCache.current.set(key, val);
+            hasValid = true;
+          }
         });
+        // Clear stale cache if nothing valid
+        if (!hasValid) {
+          sessionStorage.removeItem("pj-story-cache");
+        }
       }
-    } catch {}
+    } catch {
+      // Clear corrupted cache
+      sessionStorage.removeItem("pj-story-cache");
+    }
   }, []);
 
   // Persist bookmarks
@@ -92,7 +104,8 @@ export default function Home() {
 
     // Check client-side cache first
     const cached = clientCache.current.get(category);
-    if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
+    if (cached && cached.stories?.length > 0 && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
+      console.log(`[PJ] Client cache HIT for "${category}" (${cached.stories.length} stories)`);
       setArticles(cached.stories);
       setFromCache(true);
       return;
@@ -103,8 +116,10 @@ export default function Home() {
     setStatus("Searching for good news...");
 
     try {
+      console.log(`[PJ] Fetching /api/news?category=${category}`);
       const res = await fetch(`/api/news?category=${category}`);
       const data = await res.json();
+      console.log(`[PJ] Response:`, { ok: res.ok, status: res.status, storyCount: data.stories?.length, cached: data.cached, error: data.error });
 
       if (!res.ok) {
         throw new Error(data.error || `Server error ${res.status}`);
@@ -113,7 +128,7 @@ export default function Home() {
       setFromCache(data.cached || false);
 
       if (!data.stories || data.stories.length === 0) {
-        setError("No stories found — try another category!");
+        setError(data.error || "No stories found — try another category!");
       } else {
         setArticles(data.stories);
         // Store in client cache
@@ -124,7 +139,7 @@ export default function Home() {
         saveClientCache();
       }
     } catch (e) {
-      console.error("loadNews error:", e);
+      console.error("[PJ] loadNews error:", e);
       setError(e.message || "Couldn't fetch stories. Please try again.");
     }
     setLoading(false);
