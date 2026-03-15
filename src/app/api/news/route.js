@@ -5,7 +5,7 @@ import { CATEGORY_QUERIES } from "@/lib/constants";
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 // Use a widely available model
-const MODEL = "claude-sonnet-4-5-20250929";
+const MODEL = "claude-haiku-4-5-20251001";
 
 function parseArticles(textContent, category) {
   try {
@@ -69,7 +69,7 @@ After searching, return ONLY a valid JSON array with no other text, no markdown 
 - "date" (string, e.g. "March 2026")
 - "mood" (one of: hopeful, inspiring, breakthrough, heartwarming)
 
-Return 5-7 real, verifiable stories with accurate URLs. Focus on genuinely positive developments.`;
+Return 12-15 real, verifiable stories with accurate URLs. Focus on genuinely positive developments.`;
 
   const userMessage = `Find recent positive news about: ${query}. Return ONLY the JSON array.`;
 
@@ -77,10 +77,10 @@ Return 5-7 real, verifiable stories with accurate URLs. Focus on genuinely posit
   console.log(`[Placing Jade] Fetching "${category}" with web search, model=${MODEL}`);
   let result = await callAnthropic({
     model: MODEL,
-    max_tokens: 3000,
+    max_tokens: 6000,
     system: systemPrompt,
     messages: [{ role: "user", content: userMessage }],
-    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
+    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 10 }],
   });
 
   // Attempt 2: if web search failed, retry without tools
@@ -89,7 +89,7 @@ Return 5-7 real, verifiable stories with accurate URLs. Focus on genuinely posit
 
     result = await callAnthropic({
       model: MODEL,
-      max_tokens: 3000,
+      max_tokens: 6000,
       system: systemPrompt + "\n\nNote: Web search is unavailable. Use your existing knowledge to provide real stories. Include accurate details.",
       messages: [{ role: "user", content: userMessage }],
     });
