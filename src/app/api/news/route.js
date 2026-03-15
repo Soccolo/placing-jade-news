@@ -2,18 +2,27 @@ import { NextResponse } from "next/server";
 import { getCachedStories, setCachedStories } from "@/lib/cache";
 import { CATEGORY_QUERIES } from "@/lib/constants";
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const MODEL = "gemini-2.5-flash";
 
-// Use a widely available model
-const MODEL = "claude-haiku-4-5-20251001";
-
-function parseArticles(textContent, category) {
+function parseArticles(textContent, groundingChunks, category) {
+  // First try to extract JSON from the response
   try {
     let cleaned = textContent.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
     const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
       if (Array.isArray(parsed) && parsed.length > 0) {
+        // Build a URL lookup from grounding chunks
+        const urlMap = {};
+        if (groundingChunks) {
+          groundingChunks.forEach((chunk) => {
+            if (chunk.web) {
+              urlMap[chunk.web.title?.toLowerCase()] = chunk.web.uri;
+            }
+          });
+        }
+
         return parsed.map((a, i) => ({
           id: `${category}-${Date.now()}-${i}`,
           title: a.title || "Untitled Story",
@@ -35,20 +44,35 @@ function parseArticles(textContent, category) {
   return [];
 }
 
-async function callAnthropic(body) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
+async function callGemini(contents, useSearch = true) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+
+  const body = {
+    contents: [
+      {
+        parts: [{ text: contents }],
+      },
+    ],
+    generationConfig: {
+      maxOutputTokens: 6000,
+      temperature: 0.7,
     },
+  };
+
+  // Add Google Search grounding tool
+  if (useSearch) {
+    body.tools = [{ google_search: {} }];
+  }
+
+  const response = await fetch(`${url}?key=${GEMINI_API_KEY}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
 
   if (!response.ok) {
     const errText = await response.text();
-    console.error(`[Placing Jade] Anthropic ${response.status}:`, errText);
+    console.error(`[Placing Jade] Gemini ${response.status}:`, errText);
     return { ok: false, status: response.status, error: errText };
   }
 
@@ -56,10 +80,10 @@ async function callAnthropic(body) {
   return { ok: true, data };
 }
 
-async function fetchFromAnthropic(category) {
+async function fetchFromGemini(category) {
   const query = CATEGORY_QUERIES[category] || CATEGORY_QUERIES.all;
 
-  const systemPrompt = `You are a positive news curator for "Placing Jade", a website dedicated to uplifting stories. Search for real, recent positive news stories, then return your findings.
+  const prompt = `You are a positive news curator for "Placing Jade", a website dedicated to uplifting stories. Search for real, recent positive news stories about: ${query}
 
 After searching, return ONLY a valid JSON array with no other text, no markdown backticks, no explanation. Each object must have:
 - "title" (string, compelling headline)
@@ -69,64 +93,56 @@ After searching, return ONLY a valid JSON array with no other text, no markdown 
 - "date" (string, e.g. "March 2026")
 - "mood" (one of: hopeful, inspiring, breakthrough, heartwarming)
 
-Return 8-10 real, verifiable stories with accurate URLs. Focus on genuinely positive developments.`;
+Return 12-15 real, verifiable stories with accurate URLs. Focus on genuinely positive developments. Return ONLY the JSON array.`;
 
-  const userMessage = `Find recent positive news about: ${query}. Return ONLY the JSON array.`;
+  // Attempt 1: with Google Search grounding
+  console.log(`[Placing Jade] Fetching "${category}" with Google Search grounding`);
+  let result = await callGemini(prompt, true);
 
-  // Attempt 1: with web search
-  console.log(`[Placing Jade] Fetching "${category}" with web search, model=${MODEL}`);
-  let result = await callAnthropic({
-    model: MODEL,
-    max_tokens: 6000,
-    system: systemPrompt,
-    messages: [{ role: "user", content: userMessage }],
-    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
-  });
-
-  // Attempt 2: if web search failed, retry without tools
+  // Attempt 2: fallback without search
   if (!result.ok) {
-    console.warn(`[Placing Jade] Web search failed (${result.status}), retrying without tools...`);
-
-    result = await callAnthropic({
-      model: MODEL,
-      max_tokens: 6000,
-      system: systemPrompt + "\n\nNote: Web search is unavailable. Use your existing knowledge to provide real stories. Include accurate details.",
-      messages: [{ role: "user", content: userMessage }],
-    });
+    console.warn(`[Placing Jade] Grounded search failed (${result.status}), retrying without search...`);
+    result = await callGemini(prompt, false);
   }
 
-  // If still failing, throw with the actual Anthropic error
   if (!result.ok) {
-    throw new Error(`Anthropic API error ${result.status}: ${result.error?.slice(0, 300)}`);
+    throw new Error(`Gemini API error ${result.status}: ${result.error?.slice(0, 300)}`);
   }
 
   const data = result.data;
+  const candidate = data.candidates?.[0];
 
-  const allText = (data.content || [])
-    .map((block) => {
-      if (block.type === "text") return block.text;
-      return "";
-    })
-    .filter(Boolean)
-    .join("\n");
-
-  if (!allText) {
-    throw new Error("No text content in API response");
+  if (!candidate || !candidate.content?.parts) {
+    throw new Error("No content in Gemini response");
   }
 
-  return parseArticles(allText, category);
+  // Extract text from all parts
+  const allText = candidate.content.parts
+    .filter((p) => p.text)
+    .map((p) => p.text)
+    .join("\n");
+
+  // Extract grounding chunks for URLs
+  const groundingChunks = candidate.groundingMetadata?.groundingChunks || [];
+
+  if (!allText) {
+    throw new Error("No text content in Gemini response");
+  }
+
+  return parseArticles(allText, groundingChunks, category);
 }
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const category = searchParams.get("category") || "all";
 
-  // Debug endpoint — visit /api/news?debug=true to check your config
+  // Debug endpoint
   if (searchParams.get("debug") === "true") {
     return NextResponse.json({
-      hasApiKey: !!ANTHROPIC_API_KEY,
-      keyPrefix: ANTHROPIC_API_KEY ? ANTHROPIC_API_KEY.slice(0, 10) + "..." : "NOT SET",
+      hasApiKey: !!GEMINI_API_KEY,
+      keyPrefix: GEMINI_API_KEY ? GEMINI_API_KEY.slice(0, 10) + "..." : "NOT SET",
       model: MODEL,
+      provider: "Google Gemini",
       categories: Object.keys(CATEGORY_QUERIES),
       timestamp: new Date().toISOString(),
     });
@@ -138,9 +154,9 @@ export async function GET(request) {
   }
 
   // Check API key
-  if (!ANTHROPIC_API_KEY) {
+  if (!GEMINI_API_KEY) {
     return NextResponse.json(
-      { error: "ANTHROPIC_API_KEY not set. Add it in Vercel → Settings → Environment Variables, then redeploy." },
+      { error: "GEMINI_API_KEY not set. Add it in Vercel → Settings → Environment Variables, then redeploy." },
       { status: 500 }
     );
   }
@@ -157,7 +173,7 @@ export async function GET(request) {
 
   // Cache miss — fetch fresh stories
   try {
-    const stories = await fetchFromAnthropic(category);
+    const stories = await fetchFromGemini(category);
 
     if (stories.length === 0) {
       return NextResponse.json(
