@@ -64,6 +64,13 @@ async function callGemini(contents, useSearch = true) {
     body.tools = [{ google_search: {} }];
   }
 
+  // When not using search, we can force JSON output
+  if (!useSearch) {
+    body.generationConfig.responseMimeType = "application/json";
+  }
+
+  console.log(`[Placing Jade] Calling Gemini (search=${useSearch})`);
+
   const response = await fetch(`${url}?key=${GEMINI_API_KEY}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -72,7 +79,7 @@ async function callGemini(contents, useSearch = true) {
 
   if (!response.ok) {
     const errText = await response.text();
-    console.error(`[Placing Jade] Gemini ${response.status}:`, errText);
+    console.error(`[Placing Jade] Gemini ${response.status}:`, errText.slice(0, 500));
     return { ok: false, status: response.status, error: errText };
   }
 
@@ -83,53 +90,88 @@ async function callGemini(contents, useSearch = true) {
 async function fetchFromGemini(category) {
   const query = CATEGORY_QUERIES[category] || CATEGORY_QUERIES.all;
 
-  const prompt = `You are a positive news curator for "Placing Jade", a website dedicated to uplifting stories. Search for real, recent positive news stories about: ${query}
+  // STEP 1: Use Google Search grounding to find real stories
+  const searchPrompt = `Find 12-15 recent, real, positive news stories about: ${query}
 
-After searching, return ONLY a valid JSON array with no other text, no markdown backticks, no explanation. Each object must have:
-- "title" (string, compelling headline)
-- "summary" (string, 4-6 sentences giving a detailed overview — what happened, why it matters, and the broader impact)
-- "source" (string, publication name)
-- "url" (string, the direct URL to the original article)
-- "date" (string, e.g. "March 2026")
-- "mood" (one of: hopeful, inspiring, breakthrough, heartwarming)
+For each story provide: the headline, a 4-6 sentence summary of what happened and why it matters, the source publication name, the URL, and the approximate date. Focus on genuinely uplifting developments.`;
 
-Return 12-15 real, verifiable stories with accurate URLs. Focus on genuinely positive developments. Return ONLY the JSON array.`;
+  console.log(`[Placing Jade] Step 1: Searching for "${category}" stories...`);
+  let searchResult = await callGemini(searchPrompt, true);
 
-  // Attempt 1: with Google Search grounding
-  console.log(`[Placing Jade] Fetching "${category}" with Google Search grounding`);
-  let result = await callGemini(prompt, true);
+  let storiesText = "";
 
-  // Attempt 2: fallback without search
-  if (!result.ok) {
-    console.warn(`[Placing Jade] Grounded search failed (${result.status}), retrying without search...`);
-    result = await callGemini(prompt, false);
+  if (searchResult.ok) {
+    const candidate = searchResult.data.candidates?.[0];
+    if (candidate?.content?.parts) {
+      storiesText = candidate.content.parts
+        .filter((p) => p.text)
+        .map((p) => p.text)
+        .join("\n");
+
+      // Also gather URLs from grounding metadata
+      const chunks = candidate.groundingMetadata?.groundingChunks || [];
+      if (chunks.length > 0) {
+        storiesText += "\n\nGrounding sources:\n";
+        chunks.forEach((c) => {
+          if (c.web) {
+            storiesText += `- ${c.web.title}: ${c.web.uri}\n`;
+          }
+        });
+      }
+    }
+    console.log(`[Placing Jade] Step 1 complete. Got ${storiesText.length} chars of content.`);
+  } else {
+    console.warn(`[Placing Jade] Grounded search failed, using ungrounded search...`);
+    // Fallback: search without grounding
+    searchResult = await callGemini(searchPrompt, false);
+    if (searchResult.ok) {
+      const candidate = searchResult.data.candidates?.[0];
+      storiesText = candidate?.content?.parts
+        ?.filter((p) => p.text)
+        .map((p) => p.text)
+        .join("\n") || "";
+    }
   }
 
-  if (!result.ok) {
-    throw new Error(`Gemini API error ${result.status}: ${result.error?.slice(0, 300)}`);
+  if (!storiesText) {
+    throw new Error("No content from search step");
   }
 
-  const data = result.data;
-  const candidate = data.candidates?.[0];
+  // STEP 2: Format into clean JSON (no search tool, force JSON output)
+  const formatPrompt = `Below are positive news stories found via web search. Convert them into a JSON array. Return ONLY a valid JSON array, no other text.
 
-  if (!candidate || !candidate.content?.parts) {
-    throw new Error("No content in Gemini response");
+Each object must have exactly these fields:
+- "title": string (compelling headline)
+- "summary": string (4-6 sentences)
+- "source": string (publication name)
+- "url": string (direct URL to original article, or "" if not available)
+- "date": string (e.g. "March 2026")
+- "mood": string (one of: "hopeful", "inspiring", "breakthrough", "heartwarming")
+
+Here are the stories to format:
+
+${storiesText}`;
+
+  console.log(`[Placing Jade] Step 2: Formatting as JSON...`);
+  const formatResult = await callGemini(formatPrompt, false);
+
+  if (!formatResult.ok) {
+    throw new Error(`Gemini format step failed: ${formatResult.status}`);
   }
 
-  // Extract text from all parts
-  const allText = candidate.content.parts
-    .filter((p) => p.text)
+  const formatCandidate = formatResult.data.candidates?.[0];
+  const jsonText = formatCandidate?.content?.parts
+    ?.filter((p) => p.text)
     .map((p) => p.text)
-    .join("\n");
+    .join("\n") || "";
 
-  // Extract grounding chunks for URLs
-  const groundingChunks = candidate.groundingMetadata?.groundingChunks || [];
+  console.log(`[Placing Jade] Step 2 complete. Parsing JSON (${jsonText.length} chars)...`);
 
-  if (!allText) {
-    throw new Error("No text content in Gemini response");
+  if (!jsonText) {
+    throw new Error("No text from format step");
   }
 
-  return parseArticles(allText, groundingChunks, category);
+  return parseArticles(jsonText, [], category);
 }
 
 export async function GET(request) {
