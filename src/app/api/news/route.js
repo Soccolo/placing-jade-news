@@ -190,6 +190,67 @@ export async function GET(request) {
     });
   }
 
+  // Test endpoint — shows raw API responses for debugging
+  if (searchParams.get("test") === "true") {
+    try {
+      // Simple test call with search
+      const testResult = await callGemini(
+        "Find 2 recent positive conservation news stories. For each give: title, 2-sentence summary, source name, URL, date.",
+        true
+      );
+
+      if (!testResult.ok) {
+        return NextResponse.json({
+          step: "search_call",
+          error: testResult.error?.slice(0, 500),
+          status: testResult.status,
+        });
+      }
+
+      const candidate = testResult.data.candidates?.[0];
+      const searchText = candidate?.content?.parts
+        ?.filter((p) => p.text)
+        .map((p) => p.text)
+        .join("\n") || "NO TEXT";
+      const groundingChunks = candidate?.groundingMetadata?.groundingChunks || [];
+      const finishReason = candidate?.finishReason;
+
+      // Now try format step
+      const formatResult = await callGemini(
+        `Convert these stories to a JSON array. Each object needs: "title", "summary", "source", "url", "date", "mood" (one of: hopeful, inspiring, breakthrough, heartwarming). Return ONLY valid JSON array.\n\n${searchText}`,
+        false
+      );
+
+      let formatText = "FORMAT CALL FAILED";
+      let parsed = null;
+      if (formatResult.ok) {
+        formatText = formatResult.data.candidates?.[0]?.content?.parts
+          ?.filter((p) => p.text)
+          .map((p) => p.text)
+          .join("\n") || "NO FORMAT TEXT";
+
+        try {
+          const cleaned = formatText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+          const match = cleaned.match(/\[[\s\S]*\]/);
+          if (match) parsed = JSON.parse(match[0]);
+        } catch (e) {
+          parsed = { parseError: e.message };
+        }
+      }
+
+      return NextResponse.json({
+        step1_searchText: searchText.slice(0, 1000),
+        step1_groundingChunks: groundingChunks.slice(0, 3),
+        step1_finishReason: finishReason,
+        step2_formatText: formatText.slice(0, 1000),
+        step2_parsed: parsed ? (Array.isArray(parsed) ? `Array of ${parsed.length} items` : parsed) : null,
+        step2_firstItem: Array.isArray(parsed) ? parsed[0] : null,
+      });
+    } catch (e) {
+      return NextResponse.json({ testError: e.message });
+    }
+  }
+
   // Validate category
   if (!CATEGORY_QUERIES[category]) {
     return NextResponse.json({ error: "Invalid category" }, { status: 400 });
