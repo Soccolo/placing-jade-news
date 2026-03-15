@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getCachedStories, setCachedStories } from "@/lib/cache";
 import { CATEGORY_QUERIES } from "@/lib/constants";
 
-const ANTHROPIC_API_KEY = "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";
+const ANTHROPIC_API_KEY = "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";
 
 // Use a widely available model
 const MODEL = "claude-sonnet-4-5-20250929";
