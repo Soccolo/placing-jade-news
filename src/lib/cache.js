@@ -1,87 +1,63 @@
-import fs from "fs";
-import path from "path";
+/**
+ * In-memory cache for Vercel serverless functions.
+ *
+ * Uses a module-level Map that persists as long as the serverless
+ * function instance stays warm (typically 5-15 minutes between requests).
+ *
+ * This replaces the file-based cache which doesn't work on Vercel's
+ * ephemeral filesystem.
+ */
 
-const CACHE_DIR = path.join(process.cwd(), ".cache");
-const DEFAULT_TTL_HOURS = parseInt(process.env.CACHE_DURATION_HOURS || "3", 10);
+const DEFAULT_TTL_HOURS = parseInt(process.env.CACHE_DURATION_HOURS || "12", 10);
 
-function ensureCacheDir() {
-  if (!fs.existsSync(CACHE_DIR)) {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-  }
-}
-
-function getCachePath(category) {
-  return path.join(CACHE_DIR, `news-${category}.json`);
-}
+// Module-level cache — survives across requests in the same warm instance
+const memoryCache = new Map();
 
 /**
  * Get cached stories for a category if they exist and aren't expired.
  * Returns { stories, cachedAt } or null if cache miss.
  */
 export function getCachedStories(category) {
-  try {
-    ensureCacheDir();
-    const cachePath = getCachePath(category);
+  const cached = memoryCache.get(category);
+  if (!cached) return null;
 
-    if (!fs.existsSync(cachePath)) return null;
+  const ageMs = Date.now() - cached.cachedAt;
+  const ttlMs = DEFAULT_TTL_HOURS * 60 * 60 * 1000;
 
-    const raw = fs.readFileSync(cachePath, "utf-8");
-    const cached = JSON.parse(raw);
-
-    const ageMs = Date.now() - cached.cachedAt;
-    const ttlMs = DEFAULT_TTL_HOURS * 60 * 60 * 1000;
-
-    if (ageMs > ttlMs) {
-      // Cache expired
-      fs.unlinkSync(cachePath);
-      return null;
-    }
-
-    return cached;
-  } catch (e) {
-    console.error("Cache read error:", e.message);
+  if (ageMs > ttlMs) {
+    memoryCache.delete(category);
     return null;
   }
+
+  console.log(`[Placing Jade] Cache HIT for "${category}" (age: ${Math.round(ageMs / 60000)}m)`);
+  return cached;
 }
 
 /**
  * Store stories in the cache for a category.
  */
 export function setCachedStories(category, stories) {
-  try {
-    ensureCacheDir();
-    const cachePath = getCachePath(category);
-    const data = {
-      category,
-      stories,
-      cachedAt: Date.now(),
-      expiresAt: Date.now() + DEFAULT_TTL_HOURS * 60 * 60 * 1000,
-    };
-    fs.writeFileSync(cachePath, JSON.stringify(data, null, 2), "utf-8");
-  } catch (e) {
-    console.error("Cache write error:", e.message);
-  }
+  memoryCache.set(category, {
+    category,
+    stories,
+    cachedAt: Date.now(),
+  });
+  console.log(`[Placing Jade] Cached ${stories.length} stories for "${category}"`);
 }
 
 /**
  * Get cache status for all categories.
  */
 export function getCacheStatus() {
-  try {
-    ensureCacheDir();
-    const files = fs.readdirSync(CACHE_DIR).filter((f) => f.startsWith("news-"));
-    return files.map((f) => {
-      const raw = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, f), "utf-8"));
-      const ageMinutes = Math.round((Date.now() - raw.cachedAt) / 60000);
-      return {
-        category: raw.category,
-        storyCount: raw.stories?.length || 0,
-        ageMinutes,
-        expired:
-          Date.now() - raw.cachedAt > DEFAULT_TTL_HOURS * 60 * 60 * 1000,
-      };
+  const status = [];
+  for (const [category, cached] of memoryCache) {
+    const ageMinutes = Math.round((Date.now() - cached.cachedAt) / 60000);
+    status.push({
+      category,
+      storyCount: cached.stories?.length || 0,
+      ageMinutes,
+      expired: Date.now() - cached.cachedAt > DEFAULT_TTL_HOURS * 60 * 60 * 1000,
     });
-  } catch {
-    return [];
   }
+  return status;
 }
