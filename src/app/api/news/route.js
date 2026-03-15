@@ -69,7 +69,7 @@ After searching, return ONLY a valid JSON array with no other text, no markdown 
 - "date" (string, e.g. "March 2026")
 - "mood" (one of: hopeful, inspiring, breakthrough, heartwarming)
 
-Return 12-15 real, verifiable stories with accurate URLs. Focus on genuinely positive developments.`;
+Return 8-10 real, verifiable stories with accurate URLs. Focus on genuinely positive developments.`;
 
   const userMessage = `Find recent positive news about: ${query}. Return ONLY the JSON array.`;
 
@@ -80,7 +80,7 @@ Return 12-15 real, verifiable stories with accurate URLs. Focus on genuinely pos
     max_tokens: 6000,
     system: systemPrompt,
     messages: [{ role: "user", content: userMessage }],
-    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 10 }],
+    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
   });
 
   // Attempt 2: if web search failed, retry without tools
